@@ -727,7 +727,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # 3. offload model to cpu
         if self.actor.engine.is_param_offload_enabled:
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
-        aggressive_empty_cache(force_sync=True)
+        # Reduce max_retries to 1 since offload functions already call gc.collect+empty_cache
+        aggressive_empty_cache(force_sync=True, max_retries=1)
 
         # 4. resume kv_cache
         if self.config.rollout.free_cache_engine:

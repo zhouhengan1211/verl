@@ -231,8 +231,6 @@ def _patch_vllm_ascend_process_weights_for_npu():
             w13_data = w13_padded.transpose(1, 2).contiguous()
             del w13_padded  # free intermediate padded tensor
             layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
-            torch_npu.npu.synchronize()
-            torch_npu.npu.empty_cache()
 
             # ---- w2_weight ----
             old_w2 = layer.w2_weight.data
@@ -241,8 +239,6 @@ def _patch_vllm_ascend_process_weights_for_npu():
             w2_data = w2_padded.transpose(1, 2).contiguous()
             del w2_padded
             layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
-            torch_npu.npu.synchronize()
-            torch_npu.npu.empty_cache()
 
             # ---- NPU format casting (preserved from original) ----
             from vllm_ascend.ascend_config import get_ascend_config

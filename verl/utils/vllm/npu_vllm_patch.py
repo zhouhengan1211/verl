@@ -71,6 +71,84 @@ def vllm_ascend_v011_matmul_and_reduce_wrapper(fn):
     return wrapper
 
 
+def _patch_fused_moe_load_w13_for_npu():
+    """Patch FusedMoE._load_w13 and _load_w2 to handle weights that are already
+    TP-sharded during verl IPC weight sync on NPU.
+
+    During verl colocate IPC weight sync, fused MoE weights (w13, w2) may arrive
+    already sharded per TP rank. The original _load_w13/_load_w2 unconditionally
+    applies a TP narrow on the loaded_weight, which causes an IndexError when the
+    loaded weight's shard_dim is already at the per-TP size (start offset exceeds
+    dimension).
+
+    This patch adds a guard: the TP narrow is only applied when the loaded weight
+    has MORE elements along shard_dim than the target shard_size, indicating it is
+    the full unsharded weight. If the weight is already at the correct shard size,
+    the narrow is skipped.
+    """
+    import torch
+
+    from vllm.model_executor.layers.fused_moe import FusedMoE
+
+    _original_load_w13 = FusedMoE._load_w13
+
+    @wraps(_original_load_w13)
+    def _patched_load_w13(
+        self,
+        expert_data: torch.Tensor,
+        shard_dim: int,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+        load_full: bool = False,
+    ):
+        if self.moe_config.is_act_and_mul:
+            shard_size = expert_data.shape[shard_dim] // 2
+        else:
+            shard_size = expert_data.shape[shard_dim]
+
+        # Only apply TP narrow if loaded_weight is larger than per-TP shard size.
+        # When the weight is already TP-sharded (e.g. from IPC colocate sync),
+        # loaded_weight.shape[shard_dim] == shard_size, so the narrow is skipped.
+        if not load_full and loaded_weight.ndim > 0:
+            if loaded_weight.shape[shard_dim] > shard_size:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+                )
+
+        # Narrow parameter and load.
+        if shard_id == "w1":
+            expert_data = expert_data.narrow(shard_dim, 0, shard_size)
+        else:
+            assert shard_id == "w3"
+            expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+        expert_data.copy_(loaded_weight)
+
+    FusedMoE._load_w13 = _patched_load_w13
+
+    _original_load_w2 = FusedMoE._load_w2
+
+    @wraps(_original_load_w2)
+    def _patched_load_w2(
+        self,
+        expert_data: torch.Tensor,
+        shard_dim: int,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+        load_full: bool = False,
+    ):
+        shard_size = expert_data.shape[shard_dim]
+        # Same guard as _load_w13: only narrow when the weight is unsharded.
+        if not load_full and loaded_weight.ndim > 0:
+            if loaded_weight.shape[shard_dim] > shard_size:
+                loaded_weight = loaded_weight.narrow(
+                    shard_dim, shard_size * tp_rank, shard_size
+                )
+        expert_data.copy_(loaded_weight)
+
+    FusedMoE._load_w2 = _patched_load_w2
+
+
 def check_vllm_ascend_before_server_launch():
     import torch_npu
     import vllm
@@ -192,6 +270,11 @@ def patch_vllm013_rotary_emb():
 if is_torch_npu_available(check_device=False):
     import vllm
     from packaging import version
+
+    # Patch FusedMoE._load_w13 / _load_w2 to handle TP-sharded weights
+    # during verl IPC weight sync. This is needed for all vllm versions
+    # because the IPC weight may already be TP-partitioned.
+    _patch_fused_moe_load_w13_for_npu()
 
     _VLLM_VERSION = version.parse(vllm.__version__)
     if _VLLM_VERSION >= version.parse("0.13.0") and _VLLM_VERSION <= version.parse("0.14.0"):

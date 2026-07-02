@@ -189,6 +189,85 @@ def patch_vllm013_rotary_emb():
     ApplyRotaryEmb.__init__ = vllm013_npu_rotary_embedding_init_impl
 
 
+def _patch_qwen3_vl_moe_load_weights_for_async_sync():
+    """Fix Qwen3MoeLLMModel.load_weights for verl async weight sync.
+
+    Bug: The original code in qwen3_vl_moe.py:load_weights (line 247) does
+         loaded_weight.transpose(-1, -2)  # no bias
+    on all fused expert weights. For 3D weights from Megatron async sync
+    (gate_up_proj shape [E, 2I, H], down_proj shape [E, H, I]), this transpose
+    swaps hidden and intermediate dimensions. Then:
+
+      gate_up_proj [E, 2I, H]:
+        after transpose → [E, H, 2I]
+        chunk(2, dim=-2) → splits dim=1 (H) instead of dim=2 (2I)
+        result: [E, H/2, 2I] = [32, 1024, 1536] per-expert — WRONG
+
+      down_proj [E, H, I]:
+        after transpose → [E, I, H]
+        passed to _load_w2 which expects [E, H, I] — WRONG layout
+
+    Fix 1: Wrap load_weights to pre-transpose 3D expert weights, so the
+    original transpose(-1, -2) cancels out as a no-op.
+
+    Fix 2: Wrap load_fused_expert_weights to iterate loaded_weight.shape[0]
+    instead of the config's num_experts. Megatron with EP=4 sends only
+    num_experts_per_rank=32 entries, but the model config has num_experts=128.
+    """
+    import typing
+    from functools import wraps
+
+    from vllm.model_executor.models.qwen3_vl_moe import Qwen3MoeLLMModel
+
+    # ---- Fix 1: load_weights - cancel out incorrect transpose ----
+    original_load_weights = Qwen3MoeLLMModel.load_weights
+
+    @wraps(original_load_weights)
+    def patched_load_weights(self, weights):
+        processed_weights = []
+        for name, tensor in weights:
+            if tensor.dim() == 3 and (
+                "experts.gate_up_proj" in name or "experts.down_proj" in name
+            ):
+                # Pre-transpose: the original method will call transpose(-1, -2)
+                # again, reverting to the correct layout. This makes the
+                # original transpose a no-op for 3D Megatron-originated weights.
+                tensor = tensor.transpose(-1, -2)
+            processed_weights.append((name, tensor))
+        return original_load_weights(self, processed_weights)
+
+    Qwen3MoeLLMModel.load_weights = patched_load_weights
+
+    # ---- Fix 2: load_fused_expert_weights - use actual expert count ----
+    original_load_fused = Qwen3MoeLLMModel.load_fused_expert_weights
+
+    @wraps(original_load_fused)
+    def patched_load_fused_expert_weights(
+        self, name, params_dict, loaded_weight, shard_id, num_experts
+    ):
+        param = params_dict[name]
+        weight_loader = typing.cast(typing.Callable[..., bool], param.weight_loader)
+        loaded_local_expert = False
+        # Use actual expert count from tensor dim 0, not config num_experts.
+        # When Megatron uses EP=4, each rank sends only 32 experts instead of
+        # the full 128, avoiding IndexError on loaded_weight[32].
+        for expert_id in range(loaded_weight.shape[0]):
+            curr_expert_weight = loaded_weight[expert_id]
+            success = weight_loader(
+                param,
+                curr_expert_weight,
+                name,
+                shard_id,
+                expert_id,
+                return_success=True,
+            )
+            if success:
+                loaded_local_expert = True
+        return loaded_local_expert
+
+    Qwen3MoeLLMModel.load_fused_expert_weights = patched_load_fused_expert_weights
+
+
 if is_torch_npu_available(check_device=False):
     import vllm
     from packaging import version
@@ -200,12 +279,20 @@ if is_torch_npu_available(check_device=False):
 
         patch_vllm013_rotary_emb()
         FusedMoE.weight_loader = vllm_v013_weight_loader_method_wrapper(FusedMoE.weight_loader)
+    elif _VLLM_VERSION >= version.parse("0.18.0") and _VLLM_VERSION < version.parse("0.19.0"):
+        # vLLM 0.18.x: Rotary + FusedMoE weight_loader + Qwen3-VL-MoE async sync fix
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+
+        patch_vllm013_rotary_emb()
+        FusedMoE.weight_loader = vllm_v013_weight_loader_method_wrapper(FusedMoE.weight_loader)
+        _patch_qwen3_vl_moe_load_weights_for_async_sync()
     elif _VLLM_VERSION >= version.parse("0.19.0"):
         # Disable flash_attn in RotaryEmbedding (NPU) when VLLM >= 0.19
         from vllm.model_executor.layers.fused_moe import FusedMoE
 
         patch_vllm013_rotary_emb()
         FusedMoE.weight_loader = vllm_v013_weight_loader_method_wrapper(FusedMoE.weight_loader)
+        _patch_qwen3_vl_moe_load_weights_for_async_sync()
 
     VERL_NPU_ENABLE_A2_PATCH_VLLM_ASCEND_MC2 = bool(int(os.getenv("VERL_NPU_ENABLE_A2_PATCH_VLLM_ASCEND_MC2", "1")))
     if VERL_NPU_ENABLE_A2_PATCH_VLLM_ASCEND_MC2:

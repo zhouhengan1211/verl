@@ -108,13 +108,25 @@ def _patch_fused_moe_load_w13_for_npu():
             shard_size = expert_data.shape[shard_dim]
 
         # Only apply TP narrow if loaded_weight is larger than per-TP shard size.
-        # When the weight is already TP-sharded (e.g. from IPC colocate sync),
-        # loaded_weight.shape[shard_dim] == shard_size, so the narrow is skipped.
+        # When the weight is already TP-sharded along shard_dim (e.g. from IPC
+        # colocate sync), loaded_weight.shape[shard_dim] == shard_size, so the
+        # narrow on shard_dim is skipped. However, the OTHER dimension may still
+        # carry the full (unsharded) intermediate_size and need TP narrowing.
         if not load_full and loaded_weight.ndim > 0:
             if loaded_weight.shape[shard_dim] > shard_size:
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
+            else:
+                # shard_dim is already at per-TP size; check if the other
+                # dimension still needs TP sharding (common for IPC weights
+                # that are TP-partitioned along a different axis).
+                other_dim = 1 - shard_dim
+                if loaded_weight.shape[other_dim] > expert_data.shape[other_dim]:
+                    tp_shard_size = expert_data.shape[other_dim]
+                    loaded_weight = loaded_weight.narrow(
+                        other_dim, tp_shard_size * tp_rank, tp_shard_size
+                    )
 
         # Narrow parameter and load.
         if shard_id == "w1":
@@ -122,6 +134,22 @@ def _patch_fused_moe_load_w13_for_npu():
         else:
             assert shard_id == "w3"
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
+
+        # On NPU, torch.narrow / torch.t return views whose storage shapes
+        # may not be correctly recognized by aclnnInplaceCopy. Try to match
+        # shapes and materialize before copying.
+        if expert_data.shape != loaded_weight.shape:
+            # The intermediate and hidden dimensions may be swapped relative
+            # to the FusedMoE parameter layout — try transposing.
+            if tuple(expert_data.shape) == tuple(loaded_weight.t().shape):
+                loaded_weight = loaded_weight.t().contiguous()
+        if expert_data.shape != loaded_weight.shape:
+            raise RuntimeError(
+                f"Shape mismatch in _load_w13: "
+                f"expert_data={expert_data.shape}, "
+                f"loaded_weight={loaded_weight.shape}, "
+                f"shard_id={shard_id}, tp_rank={tp_rank}"
+            )
         expert_data.copy_(loaded_weight)
 
     FusedMoE._load_w13 = _patched_load_w13
@@ -138,12 +166,32 @@ def _patch_fused_moe_load_w13_for_npu():
         load_full: bool = False,
     ):
         shard_size = expert_data.shape[shard_dim]
-        # Same guard as _load_w13: only narrow when the weight is unsharded.
+        # Same guard as _load_w13: only narrow when the weight is unsharded
+        # along shard_dim, otherwise try TP-narrow along the other dimension.
         if not load_full and loaded_weight.ndim > 0:
             if loaded_weight.shape[shard_dim] > shard_size:
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
+            else:
+                other_dim = 1 - shard_dim
+                if loaded_weight.shape[other_dim] > expert_data.shape[other_dim]:
+                    tp_shard_size = expert_data.shape[other_dim]
+                    loaded_weight = loaded_weight.narrow(
+                        other_dim, tp_shard_size * tp_rank, tp_shard_size
+                    )
+        # On NPU, torch.narrow / torch.t return views whose storage shapes
+        # may not be correctly recognized by aclnnInplaceCopy.
+        if expert_data.shape != loaded_weight.shape:
+            if tuple(expert_data.shape) == tuple(loaded_weight.t().shape):
+                loaded_weight = loaded_weight.t().contiguous()
+        if expert_data.shape != loaded_weight.shape:
+            raise RuntimeError(
+                f"Shape mismatch in _load_w2: "
+                f"expert_data={expert_data.shape}, "
+                f"loaded_weight={loaded_weight.shape}, "
+                f"shard_id={shard_id}, tp_rank={tp_rank}"
+            )
         expert_data.copy_(loaded_weight)
 
     FusedMoE._load_w2 = _patched_load_w2

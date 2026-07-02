@@ -210,6 +210,7 @@ def _patch_vllm_ascend_process_weights_for_npu():
     NPU cache reclaim between allocations.
     """
     try:
+        import torch
         import torch_npu
         from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 

@@ -197,6 +197,74 @@ def _patch_fused_moe_load_w13_for_npu():
     FusedMoE._load_w2 = _patched_load_w2
 
 
+def _patch_vllm_ascend_process_weights_for_npu():
+    """Patch AscendUnquantizedFusedMoEMethod.process_weights_after_loading to
+    reclaim memory from old weight tensors before allocating new padded tensors.
+
+    During verl IPC weight sync, the vllm-ascend process_weights_after_loading
+    method creates new padded+transposed+contiguous tensors for w13_weight and
+    w2_weight. The original implementation orphans the old weight tensors while
+    allocating new ones, which can OOM on NPU when memory is tight.
+
+    This patch explicitly deletes the old tensor references and triggers
+    NPU cache reclaim between allocations.
+    """
+    try:
+        import torch_npu
+        from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
+
+        _original_process = AscendUnquantizedFusedMoEMethod.process_weights_after_loading
+
+        @wraps(_original_process)
+        def _patched_process_weights_after_loading(self, layer):
+            from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+                UnquantizedFusedMoEMethod,
+            )
+
+            UnquantizedFusedMoEMethod.process_weights_after_loading(self, layer)
+
+            # ---- w13_weight ----
+            old_w13 = layer.w13_weight.data
+            w13_padded = self._maybe_pad_weight(old_w13)
+            del old_w13  # free original unpadded data
+            w13_data = w13_padded.transpose(1, 2).contiguous()
+            del w13_padded  # free intermediate padded tensor
+            layer.w13_weight = torch.nn.Parameter(w13_data, requires_grad=False)
+            torch_npu.npu.synchronize()
+            torch_npu.npu.empty_cache()
+
+            # ---- w2_weight ----
+            old_w2 = layer.w2_weight.data
+            w2_padded = self._maybe_pad_weight(old_w2)
+            del old_w2
+            w2_data = w2_padded.transpose(1, 2).contiguous()
+            del w2_padded
+            layer.w2_weight = torch.nn.Parameter(w2_data, requires_grad=False)
+            torch_npu.npu.synchronize()
+            torch_npu.npu.empty_cache()
+
+            # ---- NPU format casting (preserved from original) ----
+            from vllm_ascend.ascend_config import get_ascend_config
+            from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, maybe_trans_nz
+
+            if get_ascend_config().enable_fused_mc2:
+                layer.w13_weight.data = torch_npu.npu_format_cast(
+                    layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ
+                )
+                layer.w2_weight.data = torch_npu.npu_format_cast(
+                    layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ
+                )
+            else:
+                layer.w13_weight.data = maybe_trans_nz(layer.w13_weight.data)
+                layer.w2_weight.data = maybe_trans_nz(layer.w2_weight.data)
+
+        AscendUnquantizedFusedMoEMethod.process_weights_after_loading = (
+            _patched_process_weights_after_loading
+        )
+    except ImportError:
+        pass
+
+
 def check_vllm_ascend_before_server_launch():
     import torch_npu
     import vllm
@@ -323,6 +391,11 @@ if is_torch_npu_available(check_device=False):
     # during verl IPC weight sync. This is needed for all vllm versions
     # because the IPC weight may already be TP-partitioned.
     _patch_fused_moe_load_w13_for_npu()
+
+    # Patch vllm-ascend's process_weights_after_loading to avoid OOM during
+    # IPC weight sync. The original code creates new padded+contiguous tensors
+    # while the old weight tensors are still resident in NPU memory.
+    _patch_vllm_ascend_process_weights_for_npu()
 
     _VLLM_VERSION = version.parse(vllm.__version__)
     if _VLLM_VERSION >= version.parse("0.13.0") and _VLLM_VERSION <= version.parse("0.14.0"):

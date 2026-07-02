@@ -299,6 +299,13 @@ class vLLMColocateWorkerExtension:
             logger.info("ModelOpt QAT: process_weights_after_loading completed")
         elif use_standard_weight_load:
             # Some post-load transforms are non-idempotent; run once after all buckets.
+            # On NPU, weight loading may leave stale tensors in memory (old params
+            # replaced by IPC weights). Force GC + cache clear to reclaim memory
+            # before process_weights_after_loading allocates new padded tensors.
+            from verl.utils.memory_utils import aggressive_empty_cache
+
+            aggressive_empty_cache(force_sync=True)
+
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
             for model, model_config in self._iter_all_models_with_config():

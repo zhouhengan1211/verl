@@ -189,6 +189,58 @@ def patch_vllm013_rotary_emb():
     ApplyRotaryEmb.__init__ = vllm013_npu_rotary_embedding_init_impl
 
 
+def patch_vllm018_qwen3_vl_moe_async_weight_loading():
+    try:
+        from vllm.model_executor.models.qwen3_vl_moe import Qwen3MoeLLMModel
+    except ImportError:
+        return
+
+    if getattr(Qwen3MoeLLMModel, "_verl_npu_async_weight_loading_patched", False):
+        return
+
+    original_load_weights = Qwen3MoeLLMModel.load_weights
+
+    @wraps(original_load_weights)
+    def load_weights(self, weights):
+        num_experts = getattr(self.config, "num_experts", None)
+        adapted_weights = []
+        for name, loaded_weight in weights:
+            is_fused_expert_weight = "experts.gate_up_proj" in name or "experts.down_proj" in name
+            is_async_local_expert_weight = (
+                is_fused_expert_weight
+                and loaded_weight.dim() == 3
+                and num_experts is not None
+                and loaded_weight.shape[0] < num_experts
+            )
+            if is_async_local_expert_weight:
+                loaded_weight = loaded_weight.transpose(-1, -2)
+            adapted_weights.append((name, loaded_weight))
+        return original_load_weights(self, adapted_weights)
+
+    def load_fused_expert_weights(self, name, params_dict, loaded_weight, shard_id, num_experts):
+        param = params_dict[name]
+        weight_loader = param.weight_loader
+        loaded_local_expert = False
+        for expert_id in range(min(num_experts, loaded_weight.shape[0])):
+            curr_expert_weight = loaded_weight[expert_id]
+            success = weight_loader(
+                param,
+                curr_expert_weight,
+                name,
+                shard_id,
+                expert_id,
+                return_success=True,
+            )
+            if success:
+                loaded_local_expert = True
+
+        return loaded_local_expert
+
+    Qwen3MoeLLMModel.load_weights = load_weights
+    Qwen3MoeLLMModel.load_fused_expert_weights = load_fused_expert_weights
+    Qwen3MoeLLMModel._verl_npu_async_weight_loading_patched = True
+
+
 if is_torch_npu_available(check_device=False):
     import vllm
     from packaging import version
@@ -199,6 +251,12 @@ if is_torch_npu_available(check_device=False):
         from vllm.model_executor.layers.fused_moe import FusedMoE
 
         patch_vllm013_rotary_emb()
+        FusedMoE.weight_loader = vllm_v013_weight_loader_method_wrapper(FusedMoE.weight_loader)
+    elif _VLLM_VERSION >= version.parse("0.18.0") and _VLLM_VERSION < version.parse("0.19.0"):
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+
+        patch_vllm013_rotary_emb()
+        patch_vllm018_qwen3_vl_moe_async_weight_loading()
         FusedMoE.weight_loader = vllm_v013_weight_loader_method_wrapper(FusedMoE.weight_loader)
     elif _VLLM_VERSION >= version.parse("0.19.0"):
         # Disable flash_attn in RotaryEmbedding (NPU) when VLLM >= 0.19

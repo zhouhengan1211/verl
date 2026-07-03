@@ -103,6 +103,76 @@ def monkey_patch_compute_logits(model, vocab_size: int):
     model.compute_logits = MethodType(compute_logits, model)
 
 
+def _is_qwen3_vl_moe_model(model) -> bool:
+    """Return whether the vLLM model contains the Qwen3-VL MoE LLM module."""
+    if type(model).__name__ == "Qwen3MoeLLMModel":
+        return True
+    modules = getattr(model, "modules", None)
+    if modules is None:
+        return False
+    return any(type(module).__name__ == "Qwen3MoeLLMModel" for module in modules())
+
+
+def _patch_qwen3_vl_moe_async_expert_loader():
+    """Allow async sync to load an EP-local expert tensor into Qwen3-VL MoE.
+
+    vLLM's Qwen3MoeLLMModel.load_fused_expert_weights iterates
+    config.num_experts. During verl async sync, Megatron EP may send only the
+    local expert slice, so the loop must use the received tensor's expert dim.
+    This patch is installed only from update_weights_from_ipc, after initial
+    HF checkpoint loading has completed.
+    """
+    try:
+        from vllm.model_executor.models.qwen3_vl_moe import Qwen3MoeLLMModel
+    except ImportError:
+        return
+
+    if getattr(Qwen3MoeLLMModel, "_verl_async_expert_loader_patched", False):
+        return
+
+    def load_fused_expert_weights(self, name, params_dict, loaded_weight, shard_id, num_experts):
+        param = params_dict[name]
+        weight_loader = param.weight_loader
+        loaded_local_expert = False
+        expert_count = min(num_experts, loaded_weight.shape[0])
+        for expert_id in range(expert_count):
+            curr_expert_weight = loaded_weight[expert_id]
+            success = weight_loader(
+                param,
+                curr_expert_weight,
+                name,
+                shard_id,
+                expert_id,
+                return_success=True,
+            )
+            if success:
+                loaded_local_expert = True
+        return loaded_local_expert
+
+    Qwen3MoeLLMModel.load_fused_expert_weights = load_fused_expert_weights
+    Qwen3MoeLLMModel._verl_async_expert_loader_patched = True
+
+
+def _prepare_qwen3_vl_moe_async_weights(weights: list[tuple[str, torch.Tensor]]) -> list[tuple[str, torch.Tensor]]:
+    """Adapt Megatron/NPU fused expert tensors for vLLM's Qwen3-VL MoE loader.
+
+    Async sync sends 3D fused tensors in Megatron runtime layout:
+      gate_up_proj: [experts, 2 * intermediate, hidden]
+      down_proj:    [experts, hidden, intermediate]
+
+    vLLM's Qwen3MoeLLMModel.load_weights unconditionally applies
+    transpose(-1, -2) to fused expert tensors. Pre-transposing only in this
+    async path cancels that loader transpose without changing HF checkpoint
+    initial loading.
+    """
+    processed_weights = []
+    for name, tensor in weights:
+        if tensor.dim() == 3 and ("experts.gate_up_proj" in name or "experts.down_proj" in name):
+            tensor = tensor.transpose(-1, -2)
+        processed_weights.append((name, tensor))
+    return processed_weights
+
+
 class vLLMColocateWorkerExtension:
     """
     The class for vLLM's worker to inherit from, in the colocate setting.
@@ -227,6 +297,11 @@ class vLLMColocateWorkerExtension:
             # Re-apply here because async IPC weight sync can happen long after init and lose MoE weight_loader attrs.
             for model in self._iter_all_models():
                 patch_vllm_moe_model_weight_loader(model)
+            self._qwen3_vl_moe_async_model_ids = {
+                id(model) for model in self._iter_all_models() if _is_qwen3_vl_moe_model(model)
+            }
+            if self._qwen3_vl_moe_async_model_ids:
+                _patch_qwen3_vl_moe_async_expert_loader()
 
         assert self.device is not None
         receiver = BucketedWeightReceiver(
@@ -285,7 +360,10 @@ class vLLMColocateWorkerExtension:
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
                 for model in self._iter_all_models():
-                    model.load_weights(weights)
+                    if id(model) in getattr(self, "_qwen3_vl_moe_async_model_ids", set()):
+                        model.load_weights(_prepare_qwen3_vl_moe_async_weights(weights))
+                    else:
+                        model.load_weights(weights)
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication.
